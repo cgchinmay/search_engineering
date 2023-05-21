@@ -1,6 +1,7 @@
 # A simple client for querying driven by user input on the command line.  Has hooks for the various
 # weeks (e.g. query understanding).  See the main section at the bottom of the file
 from opensearchpy import OpenSearch
+import signal
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 import argparse
@@ -15,6 +16,8 @@ import click
 
 from time import perf_counter
 import concurrent.futures
+from multiprocessing import Event
+from multiprocessing import Manager
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -22,7 +25,7 @@ logging.basicConfig(format='%(levelname)s:%(message)s')
 
 def get_opensearch(the_host="localhost"):
     host = the_host
-    port = 9201
+    port = 9200
     auth = ('admin', 'admin')
     client = OpenSearch(
         hosts=[{'host': host, 'port': port}],
@@ -156,6 +159,37 @@ def create_query(user_query, filters=None, sort="_score", sortDir="desc", size=1
                 ]
 
             }
+        },
+        "aggs": {
+            "department": {
+                "terms": {
+                    "field": "department.keyword",
+                    "min_doc_count": 1
+                }
+            },
+            "missing_images": {
+                "missing": {
+                    "field": "image"
+                }
+            },
+            "regularPrice": {
+                "range": {
+                    "field": "regularPrice",
+                    "ranges": [
+                        {"key": "$", "to": 100},
+                        {"key": "$$", "from": 100, "to": 200},
+                        {"key": "$$$", "from": 200, "to": 300},
+                        {"key": "$$$$", "from": 300, "to": 400},
+                        {"key": "$$$$$", "from": 400, "to": 500},
+                        {"key": "$$$$$$", "from": 500},
+                    ]
+                },
+                "aggs": {
+                    "price_stats": {
+                        "stats": {"field": "regularPrice"}
+                    }
+                }
+            }
         }
     }
     if user_query == "*" or user_query == "#":
@@ -177,9 +211,44 @@ def search(client, user_query, index="bbuy_products"):
     end = perf_counter()
     if response and response['hits']['hits'] and len(response['hits']['hits']) > 0:
         hits = response['hits']['hits']
-        logger.debug(json.dumps(response, indent=2))
+        aggregations = response["aggregations"]
+        #logger.info(json.dumps(aggregations, indent=2))
 
-        return hits
+        return hits, aggregations
+    else:
+        logger.debug(f'No results for query: {user_query}')
+        return None, None
+
+def query_opensearch(worker_num, query_file: str, host: str, index_name: str, max_queries: int, seed: int, stop_event):
+    logger.info(f"Loading query file from {query_file} and using seed {seed} for worker: {worker_num}")
+    query_df = pd.read_csv(query_file, parse_dates=['click_time', 'query_time'])
+    queries = query_df["query"].sample(n=max_queries, random_state=seed)
+    #logger.info(f'query len: {len(queries)}')
+    client = get_opensearch(host)
+    start = perf_counter()
+    i = 0
+    modulo = 1000
+    logger.info(f"WN: {worker_num}: Running queries, checking in every {modulo} queries:")
+    for query in queries:
+        try:
+            hits, aggregations = search(client, query, index_name)
+            if i % modulo == 0 and hits is not None:
+                logger.info(f"WN: {worker_num}: Query: {query} has {len(hits)} hits.")
+                if len(hits) > 0:
+                    logger.info(f"WN: {worker_num}: First result: {hits[0]}")
+                if aggregations is not None:
+                    logger.info(f'WN: {worker_num}: Aggs: {aggregations}')
+        except:
+            logger.warn(f'WN: {worker_num}: Failed to process query: {query}')
+        i+= 1
+        if stop_event.is_set():
+            logger.info(f"WN: {worker_num}: Stopped early.")
+            end = perf_counter()
+            return (end-start)
+
+    end = perf_counter()
+    logger.info(f"WN: {worker_num}: Finished running {len(queries)} queries in {(end - start)/60} minutes")
+    return (end-start)
 
 
 @click.command()
@@ -187,27 +256,38 @@ def search(client, user_query, index="bbuy_products"):
 @click.option('--index_name', '-i', default="bbuy_products", help="The name of the index to write to")
 @click.option('--host', '-o', default="localhost", help="The name of the host running OpenSearch")
 @click.option('--max_queries', '-m', default=500, help="The maximum number of queries to run.  Set to -1 to run all.")
-def main(query_file: str, index_name: str, host: str, max_queries: int):
-    logger.info(f"Loading query file from {query_file}")
-    query_df = pd.read_csv(query_file, parse_dates=['click_time', 'query_time'])
-    queries = query_df["query"][0:max_queries]
-    client = get_opensearch(host)
-    start = perf_counter()
-    i = 0
-    modulo = 1000
-    logger.info(f"Running queries, checking in every {modulo} queries:")
-    for query in queries:
-        i+= 1
-        hits = search(client, query, index_name)
-        if i % modulo == 0 and hits is not None:
-            logger.info(f"Query: {query} has {len(hits)} hits.")
+@click.option('--seed', '-s', default=42, help="The seed to use for random sampling.  If multiple workers are used, a different seed will be given to each worker as a multiple of this seed.")
+@click.option('--workers', '-w', default=1, help="The number of workers/processes to use")
+def main(query_file: str, index_name: str, host: str, max_queries: int, seed: int, workers: int):
 
+    start = perf_counter()
+    time_querying = 0
+
+    with Manager() as manager:
+        stop_event = manager.Event()
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(query_opensearch, i, query_file, host, index_name, max_queries, seed*(i+1), stop_event) for i in range(workers)]
+
+            # Define a signal handler to shut down the process pool when Ctrl+C is pressed
+            def signal_handler(sig, frame):
+                print()
+                print("Caught SIGINT. Shutting down workers...")
+                print()
+                for future in futures:
+                    # cancel any tasks not yet running
+                    future.cancel()
+                    # signal running tasks in the process pool to stop
+                    stop_event.set()
+
+            # Register the signal handler for SIGINT 
+            signal.signal(signal.SIGINT, signal_handler)
+
+            for future in concurrent.futures.as_completed(futures):
+                time = future.result()
+                logger.info(f"Query worker finished in time: {time/60}")
 
     end = perf_counter()
-    logger.info(f"Finished running {len(queries)} queries in {(end - start)/60} minutes")
     
-    
-
 if __name__ == "__main__":
     main()
-
